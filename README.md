@@ -1,6 +1,6 @@
-# Docker Compose Indicator
-
-A GNOME Shell (45–48) panel extension to bring a Docker Compose stack up or
+# Compose-Toggle
+**Compose-Toggle** is a lightweight GNOME Shell extension that provides a simple way to start and stop a single Docker Compose stack directly from the top panel. It is designed with a security-first approach: unlike many Docker desktop integrations, it does **not** require adding users to the `docker` group, does **not** run privileged background services, and does **not** continuously monitor the Docker daemon. Every privileged operation is explicitly initiated by the user, keeping the trusted computing base as small as possible while making common `docker compose up` and `docker compose down` workflows convenient.
+A GNOME Shell (45–50) panel extension to bring a Docker Compose stack up or
 down from the top bar, with a strict security model: no docker group
 membership, no background monitoring, no automatic privilege elevation.
 
@@ -11,8 +11,8 @@ membership, no background monitoring, no automatic privilege elevation.
 - Every elevation corresponds to an explicit user gesture (flipping the
   toggle, registering the compose file, running the diagnostic). You get the
   standard system authentication prompt each time — by design.
-- The panel indicator has 4 states: **green** (up), **red** (down),
-  **orange** (action in progress), **grey** (error).
+- The panel indicator has 4 states: **green** (up), **grey** (down),
+  **grey** (action in progress), **red** (error).
 
 ### Display contract
 
