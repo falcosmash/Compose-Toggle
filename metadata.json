@@ -1,0 +1,10 @@
+{
+  "uuid": "docker-compose-indicator@falco",
+  "name": "Docker Compose Indicator",
+  "description": "Panel indicator to bring a Docker Compose stack up or down. State reflects the result of the last action started from the extension (no background monitoring, no automatic privilege elevation). Requires a one-time system install of the compose-ctl helper script — the extension will guide you through it.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "settings-schema": "org.gnome.shell.extensions.docker-compose",
+  "gettext-domain": "docker-compose-indicator",
+  "url": "https://github.com/falcosmash/compose-ctl",
+  "version": 1
+}

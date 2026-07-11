@@ -1,0 +1,17 @@
+/* Indicator state colors — applied to the St.Icon in the panel. */
+
+.dc-state-on {
+    color: #33d17a; /* GNOME green 3 */
+}
+
+.dc-state-off {
+    color: #9a9996; /* GNOME light 4 (neutral grey) */    
+}
+
+.dc-state-pending {
+    color: #9a9996; /* GNOME light 4 (neutral grey) */
+}
+
+.dc-state-error {
+    color: #e01b24; /* GNOME red 3 */    
+}

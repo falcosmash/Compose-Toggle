@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="docker-compose-indicator">
+  <schema id="org.gnome.shell.extensions.docker-compose"
+          path="/org/gnome/shell/extensions/docker-compose/">
+    <key name="last-known-state" type="s">
+      <default>'off'</default>
+      <summary>Last confirmed stack state</summary>
+      <description>
+        Result of the last completed up/down action: 'on' or 'off'.
+        Restored at session start; never queried from Docker.
+      </description>
+    </key>
+    <key name="last-result-timestamp" type="x">
+      <default>0</default>
+      <summary>Unix timestamp of the last confirmed result</summary>
+      <description>
+        When the last up/down action completed. 0 means no action has ever
+        completed. Shown to the user so the "last result" display contract
+        stays legible.
+      </description>
+    </key>
+  </schema>
+</schemalist>

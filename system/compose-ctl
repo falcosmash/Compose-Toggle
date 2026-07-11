@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# compose-ctl — system backend for the Docker Compose Indicator GNOME Shell extension.
+#
+# Installed root:root 755 at /usr/libexec/compose-ctl/compose-ctl (see README).
+# Privileged subcommands (up, down, check, set-path) are invoked through pkexec
+# by the extension; `version` is the only unprivileged subcommand.
+
+
+set -euo pipefail
+
+INTERFACE_VERSION='1.0.2'
+TIMEOUT_SECS=120
+
+# Exit codes (documented in plan.md §4.4)
+EX_COMPOSE=1   # compose action failed (total or partial)
+EX_FILE=2      # compose file missing/unreadable
+EX_DAEMON=3    # container daemon unreachable
+EX_NOCONF=5    # no configuration for the calling uid
+EX_PRIV=6      # wrong privilege or caller uid undeterminable
+EX_BADPATH=7   # set-path validation failed
+EX_NOBIN=8     # no compose binary found
+
+# Test mode: only honored when NOT running as root, so it can never widen
+# privileges. Lets the bats suite exercise the script unprivileged with a
+# relocated /etc prefix and a mocked docker binary.
+TEST_MODE=0
+PREFIX=''
+if [[ ${COMPOSE_CTL_TEST:-0} == 1 && $EUID -ne 0 ]]; then
+    TEST_MODE=1
+    PREFIX=${COMPOSE_CTL_PREFIX:-}
+fi
+CONF_DIR="${PREFIX}/etc/compose-ctl/conf.d"
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+die() {
+    # die <exit-code> <message>
+    local code=$1; shift
+    echo "compose-ctl: $*" >&2
+    exit "$code"
+}
+
+require_root() {
+    if [[ $TEST_MODE == 1 ]]; then
+        return 0
+    fi
+    if [[ $EUID -ne 0 ]]; then
+        die "$EX_PRIV" "this subcommand must run as root (via pkexec)"
+    fi
+}
+
+caller_uid() {
+    # Real caller uid: $PKEXEC_UID is set by pkexec and not forgeable by the
+    # caller; $SUDO_UID is the fallback for the documented sudo alternative.
+    local uid="${PKEXEC_UID:-${SUDO_UID:-}}"
+    if [[ -z $uid && $TEST_MODE == 1 ]]; then
+        uid=$(id -u)
+    fi
+    if [[ -z $uid ]]; then
+        die "$EX_PRIV" "cannot determine calling user (no PKEXEC_UID/SUDO_UID)"
+    fi
+    if ! [[ $uid =~ ^[0-9]+$ ]]; then
+        die "$EX_PRIV" "invalid caller uid"
+    fi
+    printf '%s' "$uid"
+}
+
+read_conf() {
+    # Sets COMPOSE_FILE_PATH from the caller's conf. Never sources the file.
+    local uid=$1
+    local conf="$CONF_DIR/$uid.conf"
+    if [[ ! -f $conf ]]; then
+        die "$EX_NOCONF" "no configuration for uid $uid ($conf)"
+    fi
+    COMPOSE_FILE_PATH=$(grep -E '^COMPOSE_FILE=' "$conf" | head -n1 | cut -d= -f2-)
+    if [[ -z $COMPOSE_FILE_PATH ]]; then
+        die "$EX_NOCONF" "configuration $conf has no COMPOSE_FILE entry"
+    fi
+    if [[ ! -f $COMPOSE_FILE_PATH || ! -r $COMPOSE_FILE_PATH ]]; then
+        die "$EX_FILE" "compose file not found or unreadable: $COMPOSE_FILE_PATH"
+    fi
+}
+
+detect_compose() {
+    # Sets COMPOSE_CMD (argv array) and RUNTIME. Chosen backend goes to stderr.
+    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+        COMPOSE_CMD=(docker compose); RUNTIME=docker
+    elif command -v docker-compose >/dev/null 2>&1; then
+        COMPOSE_CMD=(docker-compose); RUNTIME=docker
+    elif command -v podman-compose >/dev/null 2>&1; then
+        COMPOSE_CMD=(podman-compose); RUNTIME=podman
+    else
+        return 1
+    fi
+    echo "compose-ctl: backend = ${COMPOSE_CMD[*]}" >&2
+    return 0
+}
+
+check_daemon() {
+    # Client-side `version` succeeds without a daemon; `info` requires one.
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 15 "$RUNTIME" info >/dev/null 2>&1
+    else
+        "$RUNTIME" info >/dev/null 2>&1
+    fi
+}
+
+# Project naming: compose's own resolution is used deliberately — no -p.
+# The project name is the compose-file directory's basename, or the
+# top-level `name:` key if the YAML declares one: exactly what the CLI
+# does.
+
+# --------------------------------------------------------------------------
+# Guarded execution: compose child in background, concurrent stdin monitor.
+# The extension keeps our stdin pipe open as a control channel; closing it
+# (disable during pending) is the only way userland can stop a root process.
+# --------------------------------------------------------------------------
+
+_GUARD_TARGET=''
+
+cleanup_guard() {
+    if [[ -n $_GUARD_TARGET ]]; then
+        kill -TERM -- "$_GUARD_TARGET" 2>/dev/null || true
+    fi
+}
+trap cleanup_guard EXIT
+
+run_guarded() {
+    local child monitor rc=0
+    local -a cmd=()
+    if command -v timeout >/dev/null 2>&1; then
+        cmd+=(timeout "$TIMEOUT_SECS")
+    fi
+    cmd+=("$@")
+
+    # setsid puts the child in its own process group so the whole compose
+    # tree can be killed at once. Absent (test envs), fall back to the pid.
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "${cmd[@]}" </dev/null &
+        child=$!
+        _GUARD_TARGET="-$child"
+    else
+        "${cmd[@]}" </dev/null &
+        child=$!
+        _GUARD_TARGET="$child"
+    fi
+
+
+    monitor=''
+    if [[ -p /dev/stdin ]]; then
+        local guard_target=$_GUARD_TARGET guard_pid=$child
+        exec {_GUARD_STDIN_FD}<&0
+        {
+            while IFS= read -r _; do :; done
+            # EOF: cancellation requested. The process group may not exist
+            # yet — an EOF observed at spawn time races setsid()'s group
+            # creation, the group kill fails with ESRCH and the action
+            # would sail on untouched. Retry until the group kill lands or
+            # the direct child is gone, then belt-and-braces the pid.
+            for _ in $(seq 1 50); do
+                kill -TERM -- "$guard_target" 2>/dev/null && break
+                kill -0 "$guard_pid" 2>/dev/null || break
+                sleep 0.1
+            done
+            kill -TERM "$guard_pid" 2>/dev/null || true
+        } <&"$_GUARD_STDIN_FD" &
+        monitor=$!
+        # The monitor holds its own duplicate; the parent's copy can go.
+        exec {_GUARD_STDIN_FD}<&-
+    fi
+
+    wait "$child" || rc=$?
+    _GUARD_TARGET=''
+    if [[ -n $monitor ]]; then
+        kill "$monitor" 2>/dev/null || true
+        wait "$monitor" 2>/dev/null || true
+    fi
+
+    # Never leak 126/127 (reserved for pkexec); 124 is `timeout` expiring.
+    if [[ $rc -eq 124 || $rc -eq 125 || $rc -eq 126 || $rc -eq 127 ]]; then
+        echo "compose-ctl: command timed out or could not be executed (rc=$rc)" >&2
+        rc=$EX_COMPOSE
+    fi
+    return "$rc"
+}
+
+# --------------------------------------------------------------------------
+# Post-action report ("constat"): real state of the project, printed as one
+# JSON line on stdout regardless of the action's success.
+# --------------------------------------------------------------------------
+
+emit_report() {
+    # emit_report <ok|failed> <compose-file>
+    local result=$1 file=$2
+    local running=0 total=0 out
+
+    if out=$("${COMPOSE_CMD[@]}" -f "$file" ps -a --format json 2>/dev/null); then
+        # docker compose v2 emits JSONL (or an array in older builds); both
+        # are covered by a textual scan of "State" keys.
+        # `|| true` is load-bearing: after a successful `down` the project has
+        # zero containers, grep matches nothing and exits 1 — under
+        # `set -e -o pipefail` that killed the whole script mid-report and
+        # turned every nominal down into exit 1. wc has already printed its
+        # count when the pipeline status is decided, so the value is correct.
+        total=$(grep -o '"State" *: *"[^"]*"' <<<"$out" | wc -l | tr -d ' ' || true)
+        running=$(grep -o '"State" *: *"running"' <<<"$out" | wc -l | tr -d ' ' || true)
+    elif out=$("${COMPOSE_CMD[@]}" -f "$file" ps -aq 2>/dev/null); then
+        # Fallback (compose v1, podman-compose): container-id counting.
+        total=$(grep -c . <<<"$out" || true)
+        out=$("${COMPOSE_CMD[@]}" -f "$file" ps -q 2>/dev/null) || out=''
+        running=$(grep -c . <<<"$out" || true)
+    fi
+
+    printf '{"result":"%s","running":%d,"total":%d}\n' "$result" "$running" "$total"
+}
+
+# --------------------------------------------------------------------------
+# Subcommands
+# --------------------------------------------------------------------------
+
+cmd_action() {
+    # cmd_action <up|down>
+    local action=$1 uid rc=0
+    require_root
+    uid=$(caller_uid)
+    read_conf "$uid"
+    if ! detect_compose; then
+        die "$EX_NOBIN" "no compose binary found (docker compose / docker-compose / podman-compose)"
+    fi
+    if ! check_daemon; then
+        die "$EX_DAEMON" "container daemon is not reachable"
+    fi
+    local -a args
+    if [[ $action == up ]]; then
+        args=(up -d)
+    else
+        args=(down)
+    fi
+
+    run_guarded "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE_PATH" "${args[@]}" || rc=$?
+
+    if [[ $rc -eq 0 ]]; then
+        emit_report ok "$COMPOSE_FILE_PATH"
+        exit 0
+    else
+        emit_report failed "$COMPOSE_FILE_PATH"
+        exit "$EX_COMPOSE"
+    fi
+}
+
+cmd_check() {
+    require_root
+    local uid binary='' daemon=false conf=false file='' fail_code=0
+
+    if detect_compose; then
+        binary="${COMPOSE_CMD[*]}"
+        if check_daemon; then
+            daemon=true
+        else
+            fail_code=$EX_DAEMON
+        fi
+    else
+        fail_code=$EX_NOBIN
+    fi
+
+    uid=$(caller_uid)
+    if [[ -f "$CONF_DIR/$uid.conf" ]]; then
+        conf=true
+        local path
+        path=$(grep -E '^COMPOSE_FILE=' "$CONF_DIR/$uid.conf" | head -n1 | cut -d= -f2-)
+        if [[ -n $path && -f $path && -r $path ]]; then
+            file=$path
+        elif [[ $fail_code -eq 0 ]]; then
+            fail_code=$EX_FILE
+        fi
+    elif [[ $fail_code -eq 0 ]]; then
+        fail_code=$EX_NOCONF
+    fi
+
+    local result=ok
+    if [[ $fail_code -ne 0 ]]; then
+        result=failed
+    fi
+    printf '{"result":"%s","version":"%s","binary":"%s","daemon":%s,"conf":%s,"file":"%s"}\n' \
+        "$result" "$INTERFACE_VERSION" "$binary" "$daemon" "$conf" "$file"
+    exit "$fail_code"
+}
+
+cmd_set_path() {
+    require_root
+    if [[ $# -ne 1 ]]; then
+        die "$EX_BADPATH" "usage: compose-ctl set-path /absolute/path/to/docker-compose.yml"
+    fi
+    local path=$1 uid tmp target
+
+    if [[ $path != /* ]]; then
+        die "$EX_BADPATH" "path must be absolute"
+    fi
+    if [[ $path =~ [[:cntrl:]] ]]; then
+        die "$EX_BADPATH" "path contains control characters"
+    fi
+    if [[ $path == *:* ]]; then
+        die "$EX_BADPATH" "compose file lists (a.yml:b.yml) are not supported"
+    fi
+    if [[ $path != *.yml && $path != *.yaml ]]; then
+        die "$EX_BADPATH" "file must have a .yml or .yaml extension"
+    fi
+    if [[ ! -f $path || ! -r $path ]]; then
+        die "$EX_BADPATH" "file does not exist or is not readable"
+    fi
+
+    uid=$(caller_uid)
+
+    if [[ ! -d $CONF_DIR ]]; then
+        install -d -m 755 "$CONF_DIR"
+    fi
+    if [[ -L $CONF_DIR ]]; then
+        die "$EX_BADPATH" "$CONF_DIR is a symlink; refusing to write"
+    fi
+
+    target="$CONF_DIR/$uid.conf"
+    # Never follow a pre-existing symlink at the target; mv replaces the link
+    # itself, but remove it explicitly for clarity.
+    if [[ -L $target ]]; then
+        rm -f -- "$target"
+    fi
+
+    tmp=$(mktemp "$CONF_DIR/.$uid.XXXXXX")
+    {
+        echo '# Managed by compose-ctl set-path — do not edit by hand'
+        printf 'COMPOSE_FILE=%s\n' "$path"
+    } >"$tmp"
+    chmod 644 "$tmp"
+    mv -f -- "$tmp" "$target"
+
+    printf '{"result":"ok","conf":"%s"}\n' "$target"
+}
+
+cmd_version() {
+    # Unprivileged on purpose: used by the extension's silent integrity check.
+    printf '%s\n' "$INTERFACE_VERSION"
+}
+
+# --------------------------------------------------------------------------
+# Dispatch
+# --------------------------------------------------------------------------
+
+main() {
+    if [[ $# -lt 1 ]]; then
+        die "$EX_PRIV" "usage: compose-ctl <up|down|check|set-path|version>"
+    fi
+    local sub=$1; shift
+    case $sub in
+        up|down)   cmd_action "$sub" "$@" ;;
+        check)     cmd_check "$@" ;;
+        set-path)  cmd_set_path "$@" ;;
+        version)   cmd_version ;;
+        *)         die "$EX_PRIV" "unknown subcommand: $sub" ;;
+    esac
+}
+
+main "$@"
