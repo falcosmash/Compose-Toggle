@@ -1,6 +1,6 @@
 // One-shot invocations of the system script through pkexec.
 //
-// Rules (plan.md §5.3):
+// Rules:
 //   - pkexec only ever runs on an explicit user gesture; callers are
 //     responsible for verifying integrity (integrity.js) first.
 //   - Everything is asynchronous; argv is always an array, never a shell
