@@ -13,6 +13,8 @@ import {ComposeRunner, PKEXEC_DISMISSED, PKEXEC_NOT_AUTHORIZED}
 import {checkScriptFile, verifyScript, CONF_DIR, SCRIPT_PATH}
     from './integrity.js';
 
+Gio._promisify(Gio.File.prototype, 'load_contents_async');
+
 const STATE_STYLES = {
     on: 'dc-state-on',
     off: 'dc-state-off',
@@ -60,6 +62,8 @@ class ComposeIndicator extends PanelMenu.Button {
 
         this._buildMenu();
         this._watchSystemPaths();
+        this._configuredPath = null;
+        this._reloadConfiguredPath().catch(logError);
         this._initialStateCheck().catch(logError);
     }
 
@@ -217,9 +221,8 @@ class ComposeIndicator extends PanelMenu.Button {
 
     _updateTitle() {
         let label = 'Docker Compose';
-        const path = this._readConfiguredPath();
-        if (path !== null)
-            label = GLib.path_get_basename(path);
+        if (this._configuredPath !== null)
+            label = GLib.path_get_basename(this._configuredPath);
 
         const ts = this._settings.get_int64('last-result-timestamp');
         if (ts > 0) {
@@ -234,18 +237,27 @@ class ComposeIndicator extends PanelMenu.Button {
         this._titleItem.label.text = label;
     }
 
-    _readConfiguredPath() {
+    // EGO review (X-004): no synchronous file IO in shell code. The conf is
+    // read asynchronously into a cache — at startup and whenever the
+    // FileMonitor on conf.d fires — and _updateTitle() consumes the cache
+    // synchronously. The label may show the generic title for the first
+    // frames until the initial load lands; it is then refreshed.
+    async _reloadConfiguredPath() {
         const uid = new Gio.Credentials().get_unix_user();
+        const file = Gio.File.new_for_path(`${CONF_DIR}/${uid}.conf`);
+        let path = null;
         try {
-            const [ok, bytes] = GLib.file_get_contents(`${CONF_DIR}/${uid}.conf`);
-            if (!ok)
-                return null;
+            const [bytes] = await file.load_contents_async(null);
             const text = new TextDecoder().decode(bytes);
             const line = text.split('\n').find(l => l.startsWith('COMPOSE_FILE='));
-            return line ? line.slice('COMPOSE_FILE='.length) : null;
+            path = line ? line.slice('COMPOSE_FILE='.length) : null;
         } catch {
-            return null;
+            // Missing or unreadable conf: no configured path.
         }
+        if (this._destroyed)
+            return;
+        this._configuredPath = path;
+        this._updateTitle();
     }
 
     _notify(title, body) {
@@ -283,6 +295,7 @@ class ComposeIndicator extends PanelMenu.Button {
             this._setState('error', 'script');
             return;
         }
+        this._reloadConfiguredPath().catch(logError);
         if (!this._confExists()) {
             this._setState('error', 'conf');
             return;
