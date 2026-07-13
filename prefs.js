@@ -1,4 +1,4 @@
-// Preferences: 4-step setup wizard (plan.md §2) + settings.
+// Preferences: 4-step setup wizard+ settings.
 //
 // Runs in a separate process from the indicator: no shared in-memory state.
 // Coordination happens exclusively through GSettings and the conf.d file
