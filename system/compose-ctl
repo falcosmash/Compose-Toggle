@@ -11,7 +11,7 @@ set -euo pipefail
 INTERFACE_VERSION='1.0.2'
 TIMEOUT_SECS=120
 
-# Exit codes (documented in plan.md §4.4)
+# Exit codes
 EX_COMPOSE=1   # compose action failed (total or partial)
 EX_FILE=2      # compose file missing/unreadable
 EX_DAEMON=3    # container daemon unreachable
