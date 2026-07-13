@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# set-path hostile validation (plan.md §4.3).
+# set-path hostile validation.
 
 load helpers
 
